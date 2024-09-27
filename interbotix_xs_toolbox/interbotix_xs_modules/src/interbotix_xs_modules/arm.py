@@ -2,6 +2,7 @@ import math
 import rospy
 import numpy as np
 import modern_robotics as mr
+from sensor_msgs.msg import Joy
 from interbotix_xs_msgs.msg import *
 from trajectory_msgs.msg import JointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -22,10 +23,12 @@ from interbotix_xs_modules.gripper import InterbotixGripperXSInterface
 ### @param gripper_pressure_lower_limit - lowest 'effort' that should be applied to the gripper if gripper_pressure is set to 0; it should be high enough to open/close the gripper (~150 PWM or ~400 mA current)
 ### @param gripper_pressure_upper_limit - largest 'effort' that should be applied to the gripper if gripper_pressure is set to 1; it should be low enough that the motor doesn't 'overload' when gripping an object for a few seconds (~350 PWM or ~900 mA)
 ### @param init_node - set to True if the InterbotixRobotXSCore class should initialize the ROS node - this is the most Pythonic approach; to incorporate a robot into an existing ROS node though, set to False
+### @param use_dead_switch - set to True and the robot will only move when a dead switch on gamepad is pressed (default is False)
+### @param dead_switch_button_index - used when use_dead_switch is true, it indicates the button index in /joy messages to use (default is 0)
 class InterbotixManipulatorXS(object):
-    def __init__(self, robot_model, group_name="arm", gripper_name="gripper", robot_name=None, moving_time=2.0, accel_time=0.3, gripper_pressure=0.5, gripper_pressure_lower_limit=150, gripper_pressure_upper_limit=350, init_node=True):
+    def __init__(self, robot_model, group_name="arm", gripper_name="gripper", robot_name=None, moving_time=2.0, accel_time=0.3, gripper_pressure=0.5, gripper_pressure_lower_limit=150, gripper_pressure_upper_limit=350, init_node=True, use_dead_switch=False, dead_switch_button_index=0):
         self.dxl = InterbotixRobotXSCore(robot_model, robot_name, init_node)
-        self.arm = InterbotixArmXSInterface(self.dxl, robot_model, group_name, moving_time, accel_time)
+        self.arm = InterbotixArmXSInterface(self.dxl, robot_model, group_name, moving_time, accel_time, use_dead_switch, dead_switch_button_index)
         if gripper_name is not None:
             self.gripper = InterbotixGripperXSInterface(self.dxl, gripper_name, gripper_pressure, gripper_pressure_lower_limit, gripper_pressure_upper_limit)
 
@@ -35,9 +38,18 @@ class InterbotixManipulatorXS(object):
 ### @param group_name - joint group name that contains the 'arm' joints as defined in the 'motor_config' yaml file; typically, this is 'arm'
 ### @param moving_time - time [s] it should take for all joints in the arm to complete one move
 ### @param accel_time - time [s] it should take for all joints in the arm to accelerate/decelerate to/from max speed
+### @param use_dead_switch - set to True and the robot will only move when a dead switch on gamepad is pressed (default is False)
+### @param dead_switch_button_index - used when use_dead_switch is true, it indicates the button index in /joy messages to use (default is 0)
 class InterbotixArmXSInterface(object):
 
-    def __init__(self, core, robot_model, group_name, moving_time=2.0, accel_time=0.3):
+    def __init__(self, core, robot_model, group_name, moving_time=2.0, accel_time=0.3, use_dead_switch=False, dead_switch_button_index=0):
+        self.use_dead_switch = use_dead_switch
+        self.dead_switch_button_index = dead_switch_button_index
+        if self.use_dead_switch:
+            self.robot_active = False
+            rospy.Subscriber("joy", Joy, self._joy_callback)
+        else:
+            self.robot_active = True
         self.core = core
         self.group_info = self.core.srv_get_info("group", group_name)
         if (self.group_info.profile_type != "time"):
@@ -61,6 +73,10 @@ class InterbotixArmXSInterface(object):
         print("Arm Group Name: %s\nMoving Time: %.2f seconds\nAcceleration Time: %.2f seconds\nDrive Mode: Time-Based-Profile" % (group_name, moving_time, accel_time))
         print("Initialized InterbotixArmXSInterface!\n")
 
+    def _joy_callback(self, joy):
+        with self.core.js_mutex:
+            self.robot_active = bool(joy.buttons[self.dead_switch_button_index])
+
     ### @brief Helper function to publish joint positions and block if necessary
     ### @param positions - desired joint positions
     ### @param moving_time - duration in seconds that the robot should move
@@ -70,7 +86,7 @@ class InterbotixArmXSInterface(object):
         self.set_trajectory_time(moving_time, accel_time)
         self.joint_commands = list(positions)
         joint_commands = JointGroupCommand(self.group_name, self.joint_commands)
-        self.core.pub_group.publish(joint_commands)
+        self.core.pub_group.publish(joint_commands)            
         if blocking:
             rospy.sleep(self.moving_time)
         self.T_sb = mr.FKinSpace(self.robot_des.M, self.robot_des.Slist, self.joint_commands)
@@ -138,6 +154,9 @@ class InterbotixArmXSInterface(object):
     ### @param blocking - whether the function should wait to return control to the user until the robot finishes moving
     ### @return <bool> - True if position was commanded; False if it wasn't due to being outside limits
     def set_joint_positions(self, joint_positions, moving_time=None, accel_time=None, blocking=True):
+        if not self.robot_active:
+            rospy.logwarn("attempting to move robot, but dead switch is not on")
+            return
         if (self.check_joint_limits(joint_positions)):
             self.publish_positions(joint_positions, moving_time, accel_time, blocking)
             return True
@@ -149,6 +168,9 @@ class InterbotixArmXSInterface(object):
     ### @param accel_time - duration in seconds that that robot should spend accelerating/decelerating (must be less than or equal to half the moving_time)
     ### @param blocking - whether the function should wait to return control to the user until the robot finishes moving
     def go_to_home_pose(self, moving_time=None, accel_time=None, blocking=True):
+        if not self.robot_active:
+            rospy.logwarn("attempting to move robot, but dead switch is not on")
+            return
         self.publish_positions([0] * self.group_info.num_joints, moving_time, accel_time, blocking)
 
     ### @brief Command the arm to go to its Sleep pose
@@ -156,6 +178,9 @@ class InterbotixArmXSInterface(object):
     ### @param accel_time - duration in seconds that that robot should spend accelerating/decelerating (must be less than or equal to half the moving_time)
     ### @param blocking - whether the function should wait to return control to the user until the robot finishes moving
     def go_to_sleep_pose(self, moving_time=None, accel_time=None, blocking=True):
+        if not self.robot_active:
+            rospy.logwarn("attempting to move robot, but dead switch is not on")
+            return
         self.publish_positions(self.group_info.joint_sleep_positions, moving_time, accel_time, blocking)
 
     ### @brief Command a single joint to a desired position
@@ -214,8 +239,12 @@ class InterbotixArmXSInterface(object):
 
             if solution_found:
                 if execute:
-                    self.publish_positions(theta_list, moving_time, accel_time, blocking)
-                    self.T_sb = T_sd
+                    if self.robot_active:
+                        self.publish_positions(theta_list, moving_time, accel_time, blocking)
+                        self.T_sb = T_sd
+                    else:
+                        rospy.logwarn("attempting to move robot, but dead switch is not on")
+                    
                 return theta_list, True
 
         rospy.logwarn("No valid pose could be found. Returned theta_list variable may be nonsense.")
