@@ -46,7 +46,7 @@ class InterbotixArmXSInterface(object):
         self.use_dead_switch = use_dead_switch
         self.dead_switch_button_index = dead_switch_button_index
         if self.use_dead_switch:
-            self.robot_active = False
+            self.robot_active = None
             rospy.Subscriber("joy", Joy, self._joy_callback)
         else:
             self.robot_active = True
@@ -75,7 +75,20 @@ class InterbotixArmXSInterface(object):
 
     def _joy_callback(self, joy):
         with self.core.js_mutex:
-            self.robot_active = bool(joy.buttons[self.dead_switch_button_index])
+            dead_switch_status = bool(joy.buttons[self.dead_switch_button_index])
+            if self.robot_active is None:
+                # first call                
+                if dead_switch_status:
+                    self.robot_active = True
+                else:
+                    self.robot_active = False
+                    rospy.logerr("deadswitch not on, robot will not become active")
+                return            
+            if dead_switch_status == False:
+                self.robot_active = False                        
+            if dead_switch_status == True and self.robot_active == False:
+                name = rospy.get_name()
+                rospy.logwarn(f"robot will not move, you need to kill {name} and restart")
 
     ### @brief Helper function to publish joint positions and block if necessary
     ### @param positions - desired joint positions
